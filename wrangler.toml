@@ -9,8 +9,7 @@ binding = "AI"
 binding = "VECTOR_INDEX"
 index_name = "ship-log"
 
-# Usage:
-# 1. wrangler vectorize create ship-log --dimensions 384 --metric cosine
-# 2. wrangler deploy
-# 3. POST entries to /api/ingest with {documents: [{id, text, metadata: {timestamp, lat, lon, category, ...}}]}
-# 4. Search at /api/search?q=... or /api/spatial?lat=..&lon=..&radius=..
+[[d1_databases]]
+binding = "DB"
+database_name = "ship-log-db"
+database_id = "98eae8b5-6b7e-4d16-b70f-a0d05e5f6c58"

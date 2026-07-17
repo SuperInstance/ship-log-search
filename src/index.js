@@ -1,184 +1,198 @@
-// ship-log-search — Semantic + spatial search for ship logs
-// Time/location-stamped records: catches, maintenance, weather, observations
-// Deploy on Cloudflare Workers (free tier) or run locally with `wrangler dev`
+// ship-log-search v0.2.0 — D1 as system of record, Vectorize for semantic search
+// Fixes: P0 #1 (topK cap), #2 (text storage), #3 (D1 migration), #5 (XSS), #6 (error leak)
+// Architecture: D1 = source of truth, Vectorize = semantic similarity only
 
 const EMBED_MODEL = '@cf/baai/bge-small-en-v1.5';
+const VALID_CATEGORIES = ['catch', 'maintenance', 'weather', 'observation', 'navigation'];
+const SITKA_LAT = 57.053;
+const SITKA_LON = -135.33;
 
 export default {
 	async fetch(request, env) {
 		const url = new URL(request.url);
 
-		if (request.method === 'OPTIONS') {
-			return new Response(null, { headers: corsHeaders() });
-		}
+		if (request.method === 'OPTIONS') return new Response(null, { headers: corsHeaders() });
 
-		// ── Pages ──
+		// Pages
 		if (url.pathname === '/' && request.method === 'GET') return serveApp();
-		if (url.pathname === '/health' && request.method === 'GET') return json({ ok: true, model: EMBED_MODEL });
+		if (url.pathname === '/health' && request.method === 'GET') return json({ ok: true, model: EMBED_MODEL, version: '0.2.0' });
 
-		// ── Search endpoints ──
+		// Search endpoints
 		if (url.pathname === '/api/search' && request.method === 'GET') return semanticSearch(url, env);
-		if (url.pathname === '/api/spatial' && url.pathname === '/api/nearby' && request.method === 'GET') return spatialSearch(url, env);
 		if (url.pathname === '/api/nearby' && request.method === 'GET') return spatialSearch(url, env);
 		if (url.pathname === '/api/timeline' && request.method === 'GET') return timelineSearch(url, env);
 
-		// ── Data endpoints ──
+		// Data endpoints
 		if (url.pathname === '/api/ingest' && request.method === 'POST') return handleIngest(request, env);
 		if (url.pathname === '/api/log' && request.method === 'POST') return handleLog(request, env);
+		if (url.pathname === '/api/log/' && request.method === 'DELETE') return handleDeleteAll(request, env);
 		if (url.pathname === '/api/stats' && request.method === 'GET') return handleStats(env);
+
+		// Delete single entry: /api/log/:id
+		const logMatch = url.pathname.match(/^\/api\/log\/([^/]+)$/);
+		if (logMatch && request.method === 'DELETE') return handleDelete(env, logMatch[1]);
 
 		return new Response('Not Found', { status: 404, headers: corsHeaders() });
 	},
 };
 
-// ─── HTML App ─────────────────────────────────────────────────────────────────
-
-function serveApp() {
-	return new Response(APP_HTML, {
-		headers: { 'content-type': 'text/html; charset=utf-8' },
-	});
-}
-
-// ─── Semantic Search ──────────────────────────────────────────────────────────
+// ─── Semantic Search (Vectorize + D1 join) ──────────────────────────────────
 
 async function semanticSearch(url, env) {
 	const q = (url.searchParams.get('q') || '').trim();
 	if (!q) return json({ error: 'Missing "q" parameter.' }, 400);
 
 	const topK = clampInt(url.searchParams.get('k'), 1, 50, 20);
-	const category = url.searchParams.get('category'); // catch, maintenance, weather, observation, navigation
-	const startTime = url.searchParams.get('from'); // ISO timestamp
+	const category = url.searchParams.get('category');
+	const startTime = url.searchParams.get('from');
 	const endTime = url.searchParams.get('to');
 
 	try {
+		// Embed the query
 		const embedOut = await env.AI.run(EMBED_MODEL, { text: [q] });
 		const queryVector = Array.from(embedOut.data[0]);
 
-		const opts = { topK: Math.min(topK * 3, 50), returnMetadata: 'all' }; // over-fetch for filtering, capped at Vectorize 50 max
-		const result = await env.VECTOR_INDEX.query(queryVector, opts);
+		// Vectorize for semantic similarity — capped at 50
+		const result = await env.VECTOR_INDEX.query(queryVector, {
+			topK: Math.min(topK * 3, 50),
+			returnMetadata: 'all',
+		});
 
-		let matches = (result.matches || []).map((m) => ({
-			id: m.id,
-			score: m.score,
-			metadata: m.metadata || {},
+		// Get IDs from Vectorize results
+		const ids = (result.matches || []).map(m => m.id);
+
+		if (ids.length === 0) return json({ query: q, count: 0, results: [] });
+
+		// Fetch full records from D1 (source of truth)
+		const placeholders = ids.map(() => '?').join(',');
+		let sql = `SELECT * FROM logs WHERE id IN (${placeholders})`;
+		const params = [...ids];
+		if (category) { sql += ` AND category = ?`; params.push(category); }
+		if (startTime) { sql += ` AND timestamp >= ?`; params.push(startTime); }
+		if (endTime) { sql += ` AND timestamp <= ?`; params.push(endTime); }
+
+		const d1Result = await env.DB.prepare(sql).bind(...params).all();
+
+		// Build a map for ordering by Vectorize score
+		const scoreMap = new Map();
+		for (const m of (result.matches || [])) scoreMap.set(m.id, m.score);
+
+		// Join: D1 data + Vectorize score
+		let matches = (d1Result.results || []).map(row => ({
+			id: row.id,
+			score: scoreMap.get(row.id) || 0,
+			metadata: {
+				timestamp: row.timestamp,
+				lat: row.lat,
+				lon: row.lon,
+				category: row.category,
+				text: row.text,
+				location_name: row.location_name,
+			},
 		}));
 
-		// Apply filters
-		matches = filterByCategory(matches, category);
-		matches = filterByTimeRange(matches, startTime, endTime);
-
+		// Sort by score descending, slice to topK
+		matches.sort((a, b) => b.score - a.score);
 		matches = matches.slice(0, topK);
 
-		return json({
-			query: q,
-			count: matches.length,
-			filters: { category, from: startTime, to: endTime },
-			results: matches,
-		});
+		return json({ query: q, count: matches.length, filters: { category, from: startTime, to: endTime }, results: matches });
 	} catch (err) {
 		console.error('semanticSearch error:', err);
-		return json({ error: 'Search failed' }, 500); // P0 #6: don't leak internals
+		return json({ error: 'Search failed' }, 500);
 	}
 }
 
-// ─── Spatial Search (nearby entries) ──────────────────────────────────────────
+// ─── Spatial Search (D1 — no Vectorize needed) ──────────────────────────────
 
 async function spatialSearch(url, env) {
-	const lat = parseFloat(url.searchParams.get('lat'));
-	const lon = parseFloat(url.searchParams.get('lon'));
+	const lat = parseFloat(url.searchParams.get('lat') || String(SITKA_LAT));
+	const lon = parseFloat(url.searchParams.get('lon') || String(SITKA_LON));
 	const radiusKm = parseFloat(url.searchParams.get('radius') || '50');
-	const topK = clampInt(url.searchParams.get('k'), 1, 50, 20);
+	const topK = clampInt(url.searchParams.get('k'), 1, 200, 50);
 
 	if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
 		return json({ error: 'Need "lat" and "lon" parameters.' }, 400);
 	}
 
 	try {
-		// Vectorize doesn't support spatial queries natively.
-		// Strategy: query with a dummy vector, get a large batch, filter by distance.
-		// For production, replace with a dedicated spatial index (D1 + SQL, or external).
-		const dummyVec = new Array(384).fill(0.01);
-		const result = await env.VECTOR_INDEX.query(dummyVec, {
-			topK: 50,
-			returnMetadata: 'all',
-		});
+		// Bounding box approximation (±radius degrees)
+		const latDelta = radiusKm / 111.0;
+		const lonDelta = radiusKm / (111.0 * Math.cos(lat * Math.PI / 180));
 
-		let matches = (result.matches || [])
-			.map((m) => {
-				const meta = m.metadata || {};
-				const entryLat = parseFloat(meta.lat);
-				const entryLon = parseFloat(meta.lon);
-				if (!Number.isFinite(entryLat) || !Number.isFinite(entryLon)) return null;
-				const dist = haversine(lat, lon, entryLat, entryLon);
-				return { id: m.id, distance_km: dist, metadata: meta };
+		const result = await env.DB.prepare(
+			`SELECT * FROM logs
+			 WHERE lat BETWEEN ? AND ? AND lon BETWEEN ? AND ?
+			 ORDER BY timestamp DESC LIMIT 500`
+		).bind(
+			lat - latDelta, lat + latDelta,
+			lon - lonDelta, lon + lonDelta
+		).all();
+
+		// Refine with exact haversine
+		let matches = (result.results || [])
+			.map(row => {
+				const dist = haversine(lat, lon, row.lat, row.lon);
+				return dist <= radiusKm ? {
+					id: row.id,
+					distance_km: Math.round(dist * 10) / 10,
+					metadata: {
+						timestamp: row.timestamp,
+						lat: row.lat, lon: row.lon,
+						category: row.category,
+						text: row.text,
+						location_name: row.location_name,
+					},
+				} : null;
 			})
-			.filter((m) => m !== null && m.distance_km <= radiusKm)
+			.filter(m => m !== null)
 			.sort((a, b) => a.distance_km - b.distance_km)
 			.slice(0, topK);
 
-		return json({
-			origin: { lat, lon },
-			radius_km: radiusKm,
-			count: matches.length,
-			results: matches,
-		});
+		return json({ origin: { lat, lon }, radius_km: radiusKm, count: matches.length, results: matches });
 	} catch (err) {
 		console.error('spatialSearch error:', err);
 		return json({ error: 'Search failed' }, 500);
 	}
 }
 
-// ─── Timeline Search (time-ordered entries) ───────────────────────────────────
+// ─── Timeline Search (D1 — real SQL range queries) ──────────────────────────
 
 async function timelineSearch(url, env) {
-	const from = url.searchParams.get('from'); // ISO timestamp
+	const from = url.searchParams.get('from');
 	const to = url.searchParams.get('to');
 	const category = url.searchParams.get('category');
-	const topK = clampInt(url.searchParams.get('k'), 1, 100, 50);
+	const topK = clampInt(url.searchParams.get('k'), 1, 500, 100);
 
 	try {
-		// Fetch a broad set and filter by time
-		const dummyVec = new Array(384).fill(0.01);
-		const result = await env.VECTOR_INDEX.query(dummyVec, {
-			topK: 50,
-			returnMetadata: 'all',
-		});
+		let sql = `SELECT * FROM logs WHERE 1=1`;
+		const params = [];
+		if (from) { sql += ` AND timestamp >= ?`; params.push(from); }
+		if (to) { sql += ` AND timestamp <= ?`; params.push(to); }
+		if (category) { sql += ` AND category = ?`; params.push(category); }
+		sql += ` ORDER BY timestamp DESC LIMIT ?`;
+		params.push(topK);
 
-		let matches = (result.matches || [])
-			.map((m) => ({ id: m.id, metadata: m.metadata || {} }))
-			.filter((m) => {
-				const ts = m.metadata.timestamp;
-				if (!ts) return false;
-				if (from && ts < from) return false;
-				if (to && ts > to) return false;
-				return true;
-			});
+		const result = await env.DB.prepare(sql).bind(...params).all();
 
-		matches = filterByCategory(matches, category);
+		let matches = (result.results || []).map(row => ({
+			id: row.id,
+			metadata: {
+				timestamp: row.timestamp,
+				lat: row.lat, lon: row.lon,
+				category: row.category,
+				text: row.text,
+				location_name: row.location_name,
+			},
+		}));
 
-		// Sort by timestamp descending (most recent first)
-		matches.sort((a, b) => {
-			const ta = a.metadata.timestamp || '';
-			const tb = b.metadata.timestamp || '';
-			return tb.localeCompare(ta);
-		});
-
-		matches = matches.slice(0, topK);
-
-		return json({
-			from,
-			to,
-			category,
-			count: matches.length,
-			results: matches,
-		});
+		return json({ from, to, category, count: matches.length, results: matches });
 	} catch (err) {
 		console.error('timelineSearch error:', err);
 		return json({ error: 'Search failed' }, 500);
 	}
 }
 
-// ─── Ingest (bulk) ────────────────────────────────────────────────────────────
+// ─── Ingest (bulk — D1 + Vectorize) ─────────────────────────────────────────
 
 async function handleIngest(request, env) {
 	let body;
@@ -191,32 +205,54 @@ async function handleIngest(request, env) {
 	for (let i = 0; i < docs.length; i++) {
 		const d = docs[i];
 		if (!d?.id || !d?.text?.trim()) return json({ error: `documents[${i}] needs "id" and "text".` }, 400);
-		const meta = { ...d.metadata };
-		// Ensure timestamp exists for timeline queries
-		if (!meta.timestamp) meta.timestamp = new Date().toISOString();
-		cleaned.push({ id: d.id, text: d.text, metadata: meta });
+		const category = VALID_CATEGORIES.includes(d.category) ? d.category : (d.category || 'observation');
+		cleaned.push({
+			id: d.id,
+			text: d.text,
+			category,
+			timestamp: d.timestamp || d.metadata?.timestamp || new Date().toISOString(),
+			lat: d.lat ?? d.metadata?.lat ?? null,
+			lon: d.lon ?? d.metadata?.lon ?? null,
+			location_name: d.location_name ?? d.metadata?.location_name ?? null,
+			metadata: d.metadata || {},
+		});
 	}
 
 	try {
-		const out = await env.AI.run(EMBED_MODEL, { text: cleaned.map((d) => d.text) });
-		const vectors = out.data.map((v) => Array.from(v));
+		// Embed all texts
+		const out = await env.AI.run(EMBED_MODEL, { text: cleaned.map(d => [d.text, d.category, d.location_name].filter(Boolean).join(' | ')) });
+		const vectors = out.data.map(v => Array.from(v));
 
-		const records = cleaned.map((d, i) => ({ id: d.id, values: vectors[i], metadata: d.metadata }));
+		// Insert into D1 (source of truth)
+		const stmt = env.DB.prepare(
+			`INSERT OR REPLACE INTO logs (id, text, category, lat, lon, location_name, timestamp, metadata)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+		);
+		const batch = cleaned.map(d => stmt.bind(
+			d.id, d.text.slice(0, 4000), d.category, d.lat, d.lon, d.location_name,
+			d.timestamp, JSON.stringify(d.metadata)
+		));
+		await env.DB.batch(batch);
 
-		let inserted = 0;
+		// Insert into Vectorize (semantic index)
+		const records = cleaned.map((d, i) => ({
+			id: d.id,
+			values: vectors[i],
+			metadata: { timestamp: d.timestamp, category: d.category, lat: d.lat, lon: d.lon, text: d.text.slice(0, 500), location_name: d.location_name || '' },
+		}));
+
 		for (let i = 0; i < records.length; i += 100) {
 			await env.VECTOR_INDEX.insert(records.slice(i, i + 100));
-			inserted += Math.min(100, records.length - i);
 		}
 
-		return json({ ingested: inserted, model: EMBED_MODEL });
+		return json({ ingested: cleaned.length, model: EMBED_MODEL });
 	} catch (err) {
 		console.error('handleIngest error:', err);
 		return json({ error: 'Ingest failed' }, 500);
 	}
 }
 
-// ─── Quick Log (single entry, convenience) ────────────────────────────────────
+// ─── Quick Log (single entry — D1 + Vectorize) ──────────────────────────────
 
 async function handleLog(request, env) {
 	let body;
@@ -225,45 +261,83 @@ async function handleLog(request, env) {
 	if (!body?.text?.trim()) return json({ error: 'Need "text" field.' }, 400);
 
 	const id = body.id || `log-${Date.now()}`;
-	// Category whitelist (P0 #5: prevent stored XSS via category)
-	const VALID_CATEGORIES = ['catch', 'maintenance', 'weather', 'observation', 'navigation'];
 	const category = VALID_CATEGORIES.includes(body.category) ? body.category : 'observation';
-	const meta = {
-		timestamp: body.timestamp || new Date().toISOString(),
-		lat: body.lat ?? null,
-		lon: body.lon ?? null,
-		category,
-		text: (body.text || '').slice(0, 1000), // P0 #2: store the actual text!
-		location_name: body.location_name || null, // P0 #2: store location_name!
-		...body.metadata,
-	};
+	const timestamp = body.timestamp || new Date().toISOString();
+	const lat = body.lat ?? null;
+	const lon = body.lon ?? null;
+	const location_name = body.location_name || null;
+	const text = body.text.slice(0, 4000);
 
 	// Build the text to embed (include context for better embeddings)
-	const embedText = [body.text, meta.category, body.location_name].filter(Boolean).join(' | ');
+	const embedText = [text, category, location_name].filter(Boolean).join(' | ');
 
 	try {
+		// Embed
 		const out = await env.AI.run(EMBED_MODEL, { text: [embedText] });
 		const vec = Array.from(out.data[0]);
 
-		await env.VECTOR_INDEX.insert([{ id, values: vec, metadata: meta }]);
+		// D1 insert (source of truth)
+		await env.DB.prepare(
+			`INSERT OR REPLACE INTO logs (id, text, category, lat, lon, location_name, timestamp, metadata)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+		).bind(id, text, category, lat, lon, location_name, timestamp, JSON.stringify(body.metadata || {})).run();
 
-		return json({ logged: true, id, metadata: meta });
+		// Vectorize insert (semantic index)
+		await env.VECTOR_INDEX.insert([{
+			id,
+			values: vec,
+			metadata: { timestamp, category, lat, lon, text: text.slice(0, 500), location_name: location_name || '' },
+		}]);
+
+		return json({ logged: true, id, metadata: { timestamp, lat, lon, category, text, location_name } });
 	} catch (err) {
 		console.error('handleLog error:', err);
 		return json({ error: 'Log failed' }, 500);
 	}
 }
 
-// ─── Stats ────────────────────────────────────────────────────────────────────
+// ─── Delete (single entry — D1 + Vectorize) ─────────────────────────────────
+
+async function handleDelete(env, id) {
+	try {
+		await env.DB.prepare(`DELETE FROM logs WHERE id = ?`).bind(id).run();
+		try { await env.VECTOR_INDEX.deleteByIds([id]); } catch {}
+		return json({ deleted: true, id });
+	} catch (err) {
+		console.error('handleDelete error:', err);
+		return json({ error: 'Delete failed' }, 500);
+	}
+}
+
+async function handleDeleteAll(request, env) {
+	return json({ error: 'Specify an id: DELETE /api/log/:id' }, 400);
+}
+
+// ─── Stats (D1 — real counts) ───────────────────────────────────────────────
 
 async function handleStats(env) {
 	try {
-		const dummyVec = new Array(384).fill(0.01);
-		const result = await env.VECTOR_INDEX.query(dummyVec, { topK: 1, returnMetadata: 'all' });
+		const result = await env.DB.prepare(
+			`SELECT
+				COUNT(*) as total,
+				COUNT(DISTINCT category) as categories,
+				MIN(timestamp) as earliest,
+				MAX(timestamp) as latest
+			 FROM logs`
+		).first();
+
+		const catResult = await env.DB.prepare(
+			`SELECT category, COUNT(*) as count FROM logs GROUP BY category ORDER BY count DESC`
+		).all();
+
 		return json({
-			entries: result.count || 0,
+			entries: result?.total || 0,
+			categories: result?.categories || 0,
+			earliest: result?.earliest || null,
+			latest: result?.latest || null,
+			byCategory: catResult.results || [],
 			model: EMBED_MODEL,
-			endpoints: ['/api/search', '/api/nearby', '/api/timeline', '/api/log', '/api/ingest'],
+			endpoints: ['/api/search', '/api/nearby', '/api/timeline', '/api/log', '/api/log/:id (DELETE)', '/api/ingest', '/api/stats'],
 		});
 	} catch (err) {
 		console.error('handleStats error:', err);
@@ -271,37 +345,17 @@ async function handleStats(env) {
 	}
 }
 
-// ─── Filters ──────────────────────────────────────────────────────────────────
-
-function filterByCategory(matches, category) {
-	if (!category) return matches;
-	return matches.filter((m) => (m.metadata?.category || '').toLowerCase() === category.toLowerCase());
-}
-
-function filterByTimeRange(matches, startTime, endTime) {
-	if (!startTime && !endTime) return matches;
-	return matches.filter((m) => {
-		const ts = m.metadata?.timestamp;
-		if (!ts) return false;
-		if (startTime && ts < startTime) return false;
-		if (endTime && ts > endTime) return false;
-		return true;
-	});
-}
-
-// ─── Geo ──────────────────────────────────────────────────────────────────────
+// ─── Geo ────────────────────────────────────────────────────────────────────
 
 function haversine(lat1, lon1, lat2, lon2) {
-	const R = 6371; // Earth radius km
+	const R = 6371;
 	const dLat = ((lat2 - lat1) * Math.PI) / 180;
 	const dLon = ((lon2 - lon1) * Math.PI) / 180;
-	const a =
-		Math.sin(dLat / 2) ** 2 +
-		Math.cos((lat1 * Math.PI) / 180) * Math.cos((lat2 * Math.PI) / 180) * Math.sin(dLon / 2) ** 2;
+	const a = Math.sin(dLat / 2) ** 2 + Math.cos((lat1 * Math.PI) / 180) * Math.cos((lat2 * Math.PI) / 180) * Math.sin(dLon / 2) ** 2;
 	return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
-// ─── Utils ────────────────────────────────────────────────────────────────────
+// ─── Utils ──────────────────────────────────────────────────────────────────
 
 function json(payload, status = 200) {
 	return new Response(JSON.stringify(payload, null, 2), {
@@ -313,7 +367,7 @@ function json(payload, status = 200) {
 function corsHeaders() {
 	return {
 		'access-control-allow-origin': '*',
-		'access-control-allow-methods': 'GET, POST, OPTIONS',
+		'access-control-allow-methods': 'GET, POST, DELETE, OPTIONS',
 		'access-control-allow-headers': 'content-type',
 	};
 }
@@ -323,251 +377,45 @@ function clampInt(raw, lo, hi, fallback) {
 	return Number.isFinite(n) ? Math.max(lo, Math.min(hi, n)) : fallback;
 }
 
-// ─── HTML App (Map + Search + Timeline) ───────────────────────────────────────
+// ─── HTML App (placeholder — Kimi K3 redesign pending) ──────────────────────
 
+function serveApp() {
+	return new Response(APP_HTML, {
+		headers: { 'content-type': 'text/html; charset=utf-8' },
+	});
+}
+
+// Will be replaced with Kimi K3 redesign
 const APP_HTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <meta name="color-scheme" content="dark">
-<title>Ship Log · Semantic Search</title>
+<title>Ship Log · v0.2.0</title>
 <style>
-:root {
-	--bg: #0a1118; --surface: #121b24; --surface2: #1a2530;
-	--border: #243340; --text: #dce4ec; --dim: #7a8a98;
-	--accent: #4ea1d3; --accent-glow: rgba(78,161,211,0.15);
-	--green: #4ade80; --amber: #fbbf24; --red: #f87171;
-	--mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-	--sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-}
-* { box-sizing: border-box; }
-body { margin: 0; background: var(--bg); color: var(--text); font-family: var(--sans); font-size: 14px; }
-.app { display: grid; grid-template-columns: 1fr; max-width: 1100px; margin: 0 auto; padding: 16px; gap: 16px; }
-@media (min-width: 800px) { .app { grid-template-columns: 1fr 1fr; } }
-header { grid-column: 1 / -1; text-align: center; padding: 20px 0; }
-header h1 { margin: 0; font-size: 22px; font-weight: 600; }
-header h1 .accent { color: var(--accent); }
-header p { margin: 4px 0 0; color: var(--dim); font-size: 13px; }
-.panel { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
-.panel h2 { margin: 0 0 12px; font-size: 14px; color: var(--dim); text-transform: uppercase; letter-spacing: 0.05em; }
-.search-box { display: flex; gap: 8px; }
-.search-box input { flex: 1; background: var(--surface2); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; color: var(--text); font-size: 14px; outline: none; }
-.search-box input:focus { border-color: var(--accent); }
-.search-box button, .btn { background: var(--accent); color: #0a1118; border: 0; border-radius: 8px; padding: 10px 16px; font-weight: 600; cursor: pointer; font-size: 13px; }
-.btn-sm { background: var(--surface2); color: var(--dim); border: 1px solid var(--border); padding: 4px 10px; font-size: 12px; border-radius: 999px; cursor: pointer; }
-.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
-.chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
-.results { margin-top: 12px; display: flex; flex-direction: column; gap: 8px; }
-.entry { background: var(--surface2); border: 1px solid var(--border); border-radius: 8px; padding: 12px; }
-.entry .meta { display: flex; gap: 8px; align-items: center; margin-bottom: 6px; }
-.entry .cat { font-family: var(--mono); font-size: 11px; padding: 2px 8px; border-radius: 999px; }
-.cat-catch { background: rgba(74,222,128,0.15); color: var(--green); }
-.cat-maintenance { background: rgba(251,191,36,0.15); color: var(--amber); }
-.cat-weather { background: rgba(78,161,211,0.15); color: var(--accent); }
-.cat-observation { background: rgba(122,138,152,0.15); color: var(--dim); }
-.cat-navigation { background: rgba(168,85,247,0.15); color: #c084fc; }
-.entry .time { font-family: var(--mono); font-size: 12px; color: var(--dim); }
-.entry .coords { font-family: var(--mono); font-size: 11px; color: var(--dim); }
-.entry .text { margin-top: 6px; }
-.entry .score { font-family: var(--mono); font-size: 11px; color: var(--dim); float: right; }
-.tab-bar { display: flex; gap: 4px; margin-bottom: 12px; }
-.tab { padding: 6px 14px; border-radius: 8px 8px 0 0; cursor: pointer; font-size: 13px; color: var(--dim); border-bottom: 2px solid transparent; }
-.tab.active { color: var(--accent); border-bottom-color: var(--accent); }
-.hidden { display: none; }
-input.coords-input { width: 80px; background: var(--surface2); border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; color: var(--text); font-size: 13px; }
-label { font-size: 12px; color: var(--dim); }
-.log-form { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-.log-form input, .log-form textarea, .log-form select { background: var(--surface2); border: 1px solid var(--border); border-radius: 6px; padding: 8px; color: var(--text); font-size: 13px; }
-.log-form .full { grid-column: 1 / -1; }
-.log-form textarea { min-height: 60px; resize: vertical; }
+:root { --bg:#0a1118; --surface:#121b24; --surface2:#1a2530; --border:#243340; --text:#dce4ec; --dim:#7a8a98; --accent:#4ea1d3; --green:#4ade80; --amber:#fbbf24; --red:#f87171; --mono:ui-monospace,monospace; }
+* { box-sizing:border-box; }
+body { margin:0; background:var(--bg); color:var(--text); font-family:-apple-system,sans-serif; font-size:14px; }
+.container { max-width:900px; margin:0 auto; padding:16px; }
+h1 { font-size:20px; }
+.meta { color:var(--dim); font-size:13px; margin:4px 0 16px; }
+.pill { background:var(--surface2); padding:4px 10px; border-radius:999px; font-size:12px; color:var(--dim); display:inline-block; margin:2px; }
 </style>
 </head>
 <body>
-<div class="app">
-	<header>
-		<h1>Ship Log <span class="accent">Search</span></h1>
-		<p>Semantic · spatial · timeline search over your vessel's history</p>
-	</header>
-
-	<!-- Search Panel -->
-	<div class="panel" style="grid-column: 1 / -1;">
-		<div class="tab-bar">
-			<div class="tab active" data-tab="semantic" onclick="switchTab('semantic')">🔍 Semantic</div>
-			<div class="tab" data-tab="spatial" onclick="switchTab('spatial')">📍 Nearby</div>
-			<div class="tab" data-tab="timeline" onclick="switchTab('timeline')">📅 Timeline</div>
-			<div class="tab" data-tab="log" onclick="switchTab('log')">➕ Log Entry</div>
-		</div>
-
-		<!-- Semantic Search -->
-		<div id="tab-semantic">
-			<div class="search-box">
-				<input type="text" id="sem-q" placeholder="e.g. good chumming near Cape Edgecumbe, hydraulic failure, salmon set at 30 fathoms" onkeydown="if(event.key==='Enter')doSearch()">
-				<button onclick="doSearch()">Search</button>
-			</div>
-			<div class="chips">
-				<button class="btn-sm" onclick="quickSearch('good salmon catch')">good salmon catch</button>
-				<button class="btn-sm" onclick="quickSearch('engine maintenance')">engine maintenance</button>
-				<button class="btn-sm" onclick="quickSearch('bad weather rough seas')">bad weather</button>
-				<button class="btn-sm" onclick="quickSearch('hydraulic problem')">hydraulic problem</button>
-				<button class="btn-sm" onclick="quickSearch('tide change')">tide change</button>
-			</div>
-			<div class="chips" id="sem-filters"></div>
-		</div>
-
-		<!-- Spatial Search -->
-		<div id="tab-spatial" class="hidden">
-			<div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
-				<label>Lat</label><input type="number" id="sp-lat" class="coords-input" step="0.0001" placeholder="56.6">
-				<label>Lon</label><input type="number" id="sp-lon" class="coords-input" step="0.0001" placeholder="-134.0">
-				<label>Radius (km)</label><input type="number" id="sp-radius" class="coords-input" value="50">
-				<button class="btn" onclick="doSpatial()">Find Nearby</button>
-			</div>
-		</div>
-
-		<!-- Timeline -->
-		<div id="tab-timeline" class="hidden">
-			<div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
-				<label>From</label><input type="date" id="tl-from">
-				<label>To</label><input type="date" id="tl-to">
-				<select id="tl-cat" style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:6px;color:var(--text);">
-					<option value="">All categories</option>
-					<option value="catch">Catch</option>
-					<option value="maintenance">Maintenance</option>
-					<option value="weather">Weather</option>
-					<option value="observation">Observation</option>
-					<option value="navigation">Navigation</option>
-				</select>
-				<button class="btn" onclick="doTimeline()">Load Timeline</button>
-			</div>
-		</div>
-
-		<!-- Quick Log Entry -->
-		<div id="tab-log" class="hidden">
-			<div class="log-form">
-				<input type="text" id="log-text" class="full" placeholder="What happened? e.g. Chummed for 45 min, set 600 fath on the slack. 32 sockeye.">
-				<select id="log-category">
-					<option value="observation">Observation</option>
-					<option value="catch">Catch</option>
-					<option value="maintenance">Maintenance</option>
-					<option value="weather">Weather</option>
-					<option value="navigation">Navigation</option>
-				</select>
-				<input type="text" id="log-loc" placeholder="Location name (e.g. Cape Edgecumbe)">
-				<input type="number" id="log-lat" class="coords-input" step="0.0001" placeholder="Lat">
-				<input type="number" id="log-lon" class="coords-input" step="0.0001" placeholder="Lon">
-				<button class="btn full" onclick="doLog()">Log Entry</button>
-			</div>
-		</div>
-
-		<div id="status" style="margin-top:12px; font-size:13px; color:var(--dim);"></div>
-		<div id="results" class="results"></div>
-	</div>
+<div class="container">
+	<h1>Ship Log Search <span style="color:var(--accent)">v0.2.0</span></h1>
+	<p class="meta">D1 backend upgraded. Frontend redesign in progress.</p>
+	<p><a href="/api/stats" style="color:var(--accent)">Stats</a> · <a href="/api/timeline?k=10" style="color:var(--accent)">Recent</a> · <a href="/api/search?q=catch&k=5" style="color:var(--accent)">Test Search</a></p>
+	<p class="meta">Endpoints:<br>
+		<span class="pill">GET /api/search?q=</span>
+		<span class="pill">GET /api/nearby?lat=&lon=</span>
+		<span class="pill">GET /api/timeline?from=&to=</span>
+		<span class="pill">POST /api/log</span>
+		<span class="pill">DELETE /api/log/:id</span>
+		<span class="pill">GET /api/stats</span>
+	</p>
 </div>
-
-<script>
-function switchTab(tab) {
-	document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tab));
-	document.querySelectorAll('[id^="tab-"]').forEach(el => {
-		if (el.id === 'tab-' + tab) el.classList.remove('hidden');
-		else if (el.id.startsWith('tab-') && el.id !== 'tab-bar') el.classList.add('hidden');
-	});
-	document.getElementById('results').innerHTML = '';
-	document.getElementById('status').textContent = '';
-}
-
-function quickSearch(q) {
-	document.getElementById('sem-q').value = q;
-	doSearch();
-}
-
-async function doSearch() {
-	const q = document.getElementById('sem-q').value.trim();
-	if (!q) return;
-	setStatus('Searching...');
-	const res = await fetch('/api/search?q=' + encodeURIComponent(q) + '&k=20');
-	const data = await res.json();
-	if (!res.ok) return setStatus('Error: ' + (data.error || res.status), true);
-	renderResults(data.results || [], data.count);
-}
-
-async function doSpatial() {
-	const lat = document.getElementById('sp-lat').value;
-	const lon = document.getElementById('sp-lon').value;
-	const radius = document.getElementById('sp-radius').value || 50;
-	if (!lat || !lon) return setStatus('Need lat and lon.', true);
-	setStatus('Searching nearby...');
-	const res = await fetch('/api/nearby?lat=' + lat + '&lon=' + lon + '&radius=' + radius + '&k=20');
-	const data = await res.json();
-	if (!res.ok) return setStatus('Error: ' + (data.error || res.status), true);
-	renderResults(data.results || [], data.count, true);
-}
-
-async function doTimeline() {
-	const from = document.getElementById('tl-from').value;
-	const to = document.getElementById('tl-to').value;
-	const cat = document.getElementById('tl-cat').value;
-	let qs = '/api/timeline?k=50';
-	if (from) qs += '&from=' + from + 'T00:00:00Z';
-	if (to) qs += '&to=' + to + 'T23:59:59Z';
-	if (cat) qs += '&category=' + cat;
-	setStatus('Loading timeline...');
-	const res = await fetch(qs);
-	const data = await res.json();
-	if (!res.ok) return setStatus('Error: ' + (data.error || res.status), true);
-	renderResults(data.results || [], data.count, false, true);
-}
-
-async function doLog() {
-	const text = document.getElementById('log-text').value.trim();
-	if (!text) return setStatus('Need text.', true);
-	const body = {
-		text,
-		category: document.getElementById('log-category').value,
-		location_name: document.getElementById('log-loc').value || undefined,
-		lat: parseFloat(document.getElementById('log-lat').value) || undefined,
-		lon: parseFloat(document.getElementById('log-lon').value) || undefined,
-	};
-	setStatus('Logging...');
-	const res = await fetch('/api/log', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-	const data = await res.json();
-	if (!res.ok) return setStatus('Error: ' + (data.error || res.status), true);
-	document.getElementById('log-text').value = '';
-	setStatus('✅ Logged: ' + data.id);
-}
-
-function renderResults(results, count, isSpatial, isTimeline) {
-	const el = document.getElementById('results');
-	if (!results.length) { setStatus('No results.'); el.innerHTML = ''; return; }
-	setStatus(count + ' entries found');
-	el.innerHTML = results.map(r => {
-		const m = r.metadata || {};
-		const cat = m.category || 'observation';
-		const ts = m.timestamp ? new Date(m.timestamp).toLocaleString('en-US', { month: 'short', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit' }) : '';
-		const coords = (m.lat != null && m.lon != null) ? m.lat.toFixed(4) + ', ' + m.lon.toFixed(4) : '';
-		const dist = isSpatial && r.distance_km != null ? r.distance_km.toFixed(1) + ' km' : '';
-		const score = !isSpatial && !isTimeline && r.score != null ? (r.score * 100).toFixed(1) + '%' : '';
-		const locName = m.location_name ? ' · ' + m.location_name : '';
-		return '<div class="entry">' +
-			'<div class="meta">' +
-			'<span class="cat cat-' + escHtml(cat) + '">' + escHtml(cat) + '</span>' +
-			'<span class="time">' + ts + '</span>' +
-			(dist ? '<span class="time">' + dist + '</span>' : '') +
-			(score ? '<span class="score">' + score + '</span>' : '') +
-			'</div>' +
-			'<div class="text">' + escHtml(m.description || m.text || r.id) + '</div>' +
-			(coords ? '<div class="coords">' + coords + locName + '</div>' : '') +
-			'</div>';
-	}).join('');
-}
-
-function setStatus(msg, isErr) {
-	const el = document.getElementById('status');
-	el.textContent = msg;
-	el.style.color = isErr ? 'var(--red)' : 'var(--dim)';
-}
-
-function escHtml(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
-</script>
 </body>
 </html>`;
