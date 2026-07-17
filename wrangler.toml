@@ -1,0 +1,16 @@
+name = "ship-log-search"
+compatibility_date = "2026-07-17"
+main = "src/index.js"
+
+[ai]
+binding = "AI"
+
+[[vectorize]]
+binding = "VECTOR_INDEX"
+index_name = "ship-log"
+
+# Usage:
+# 1. wrangler vectorize create ship-log --dimensions 384 --metric cosine
+# 2. wrangler deploy
+# 3. POST entries to /api/ingest with {documents: [{id, text, metadata: {timestamp, lat, lon, category, ...}}]}
+# 4. Search at /api/search?q=... or /api/spatial?lat=..&lon=..&radius=..
