@@ -54,7 +54,7 @@ async function semanticSearch(url, env) {
 		const embedOut = await env.AI.run(EMBED_MODEL, { text: [q] });
 		const queryVector = Array.from(embedOut.data[0]);
 
-		const opts = { topK: topK * 3, returnMetadata: 'all' }; // over-fetch for filtering
+		const opts = { topK: Math.min(topK * 3, 50), returnMetadata: 'all' }; // over-fetch for filtering, capped at Vectorize 50 max
 		const result = await env.VECTOR_INDEX.query(queryVector, opts);
 
 		let matches = (result.matches || []).map((m) => ({
@@ -76,7 +76,8 @@ async function semanticSearch(url, env) {
 			results: matches,
 		});
 	} catch (err) {
-		return json({ error: err.message || String(err) }, 500);
+		console.error('semanticSearch error:', err);
+		return json({ error: 'Search failed' }, 500); // P0 #6: don't leak internals
 	}
 }
 
@@ -122,7 +123,8 @@ async function spatialSearch(url, env) {
 			results: matches,
 		});
 	} catch (err) {
-		return json({ error: err.message || String(err) }, 500);
+		console.error('spatialSearch error:', err);
+		return json({ error: 'Search failed' }, 500);
 	}
 }
 
@@ -171,7 +173,8 @@ async function timelineSearch(url, env) {
 			results: matches,
 		});
 	} catch (err) {
-		return json({ error: err.message || String(err) }, 500);
+		console.error('timelineSearch error:', err);
+		return json({ error: 'Search failed' }, 500);
 	}
 }
 
@@ -208,7 +211,8 @@ async function handleIngest(request, env) {
 
 		return json({ ingested: inserted, model: EMBED_MODEL });
 	} catch (err) {
-		return json({ error: err.message || String(err) }, 500);
+		console.error('handleIngest error:', err);
+		return json({ error: 'Ingest failed' }, 500);
 	}
 }
 
@@ -221,11 +225,16 @@ async function handleLog(request, env) {
 	if (!body?.text?.trim()) return json({ error: 'Need "text" field.' }, 400);
 
 	const id = body.id || `log-${Date.now()}`;
+	// Category whitelist (P0 #5: prevent stored XSS via category)
+	const VALID_CATEGORIES = ['catch', 'maintenance', 'weather', 'observation', 'navigation'];
+	const category = VALID_CATEGORIES.includes(body.category) ? body.category : 'observation';
 	const meta = {
 		timestamp: body.timestamp || new Date().toISOString(),
 		lat: body.lat ?? null,
 		lon: body.lon ?? null,
-		category: body.category || 'observation',
+		category,
+		text: (body.text || '').slice(0, 1000), // P0 #2: store the actual text!
+		location_name: body.location_name || null, // P0 #2: store location_name!
 		...body.metadata,
 	};
 
@@ -240,7 +249,8 @@ async function handleLog(request, env) {
 
 		return json({ logged: true, id, metadata: meta });
 	} catch (err) {
-		return json({ error: err.message || String(err) }, 500);
+		console.error('handleLog error:', err);
+		return json({ error: 'Log failed' }, 500);
 	}
 }
 
@@ -256,7 +266,8 @@ async function handleStats(env) {
 			endpoints: ['/api/search', '/api/nearby', '/api/timeline', '/api/log', '/api/ingest'],
 		});
 	} catch (err) {
-		return json({ error: err.message }, 500);
+		console.error('handleStats error:', err);
+		return json({ error: 'Stats failed' }, 500);
 	}
 }
 
@@ -539,7 +550,7 @@ function renderResults(results, count, isSpatial, isTimeline) {
 		const locName = m.location_name ? ' · ' + m.location_name : '';
 		return '<div class="entry">' +
 			'<div class="meta">' +
-			'<span class="cat cat-' + cat + '">' + cat + '</span>' +
+			'<span class="cat cat-' + escHtml(cat) + '">' + escHtml(cat) + '</span>' +
 			'<span class="time">' + ts + '</span>' +
 			(dist ? '<span class="time">' + dist + '</span>' : '') +
 			(score ? '<span class="score">' + score + '</span>' : '') +
