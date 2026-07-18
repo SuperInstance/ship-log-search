@@ -1,0 +1,107 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# ship-log-search — self-host stack
+#
+# One-command start:    docker compose up -d
+# Tail logs:            docker compose logs -f worker
+# Stop (keep data):     docker compose down
+# Wipe everything:      docker compose down -v
+#
+# A bridge network (`shipnet`) lets the worker and an optional Signal K
+# server talk to each other; the worker is the only service exposed to
+# the host so the nav computer browser can hit http://localhost:8787.
+# ──────────────────────────────────────────────────────────────────────────────
+
+name: ship-log-search
+
+services:
+  # ─── ship-log-search Worker ────────────────────────────────────────────────
+  # The Worker runs locally via `wrangler dev`. D1 is persisted to the
+  # `ship-log-data` volume; Workers AI + Vectorize call Cloudflare's free
+  # tier using CLOUDFLARE_API_TOKEN from .env.
+  worker:
+    build:
+      context: ..
+      dockerfile: self-host/Dockerfile
+    image: ship-log-search:self-host
+    container_name: ship-log-worker
+    restart: unless-stopped
+    init: true                          # tini-style PID 1 (extra safety on top of image's tini)
+    ports:
+      # Host port is configurable via WORKER_PORT in .env.
+      - "${WORKER_PORT:-8787}:8787"
+    environment:
+      # Cloudflare credentials for Workers AI + Vectorize.
+      # Generate at https://dash.cloudflare.com/profile/api-tokens
+      # Required scopes: Workers AI:Read, Vectorize:Edit
+      CLOUDFLARE_ACCOUNT_ID: "${CLOUDFLARE_ACCOUNT_ID:-}"
+      CLOUDFLARE_API_TOKEN:   "${CLOUDFLARE_API_TOKEN:-}"
+
+      # Write key required by the Worker's auth gate (X-Log-Key header).
+      # Generate with:  openssl rand -hex 16
+      # If left blank, the Worker runs in open-write dev mode (fine for a boat
+      # with no internet exposure; required if you set LOG_KEY to a real value).
+      LOG_KEY: "${LOG_KEY:-}"
+
+      # Surface the URL the UI should call when accessed from a phone on
+      # the boat's local Wi-Fi. Defaults to localhost; override in .env if
+      # your nav computer has a known hostname or LAN IP.
+      PUBLIC_URL: "${PUBLIC_URL:-http://localhost:8787}"
+    volumes:
+      # Persisted Miniflare state (D1 SQLite, Vectorize index, KV namespaces).
+      - ship-log-data:/data
+    networks:
+      - shipnet
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8787/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 90s
+
+  # ─── Signal K marine data server (optional) ────────────────────────────────
+  # Uncomment / start with:   docker compose --profile with-signalk up -d
+  # Web UI on http://localhost:3000  (or http://nav-computer:3000)
+  signalk:
+    image: signalk/signalk-server:latest
+    container_name: ship-log-signalk
+    restart: unless-stopped
+    init: true
+    profiles: ["with-signalk"]         # opt-in: not started by default
+    ports:
+      - "${SIGNALK_PORT:-3000}:3000"
+    environment:
+      # Run as non-root inside the container.
+      - NODE_ENV=production
+    volumes:
+      # Persisted configuration, plugin state, and recorded NMEA data.
+      - signalk-data:/signalk/data
+    networks:
+      - shipnet
+    healthcheck:
+      # Signal K exposes /signalk at root.
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:3000/signalk"]
+      interval: 60s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+# ─── Networks ────────────────────────────────────────────────────────────────
+# A user-defined bridge network gives every service a stable hostname
+# (worker, signalk) and isolates them from other Docker projects on the
+# host. The worker can reach signalk at http://signalk:3000 inside this
+# network.
+networks:
+  shipnet:
+    name: shipnet
+    driver: bridge
+
+# ─── Named volumes for persistence ───────────────────────────────────────────
+# `ship-log-data` survives `docker compose down`. To wipe and start fresh,
+# run `docker compose down -v`.
+volumes:
+  ship-log-data:
+    name: ship-log-data
+    driver: local
+  signalk-data:
+    name: ship-log-data-signalk
+    driver: local

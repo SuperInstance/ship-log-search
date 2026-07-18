@@ -1,0 +1,41 @@
+# Files NOT to copy into the Docker build context.
+# Build context is the repo root (.).
+
+# Dependencies — installed fresh inside the image via `npm ci`
+node_modules/
+.npm/
+
+# Wrangler state — never baked into an image
+.wrangler/
+
+# Git metadata
+.git/
+.gitignore
+
+# Docs, sketches, scratch files
+*.md
+!self-host/README.md
+!self-host/migrations/*.sql
+README.md
+VESSEL_SETUP.md
+new-ui.html
+
+# Self-host runtime state (in case someone mounts the dir)
+self-host/.env
+self-host/data/
+self-host/backups/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Python / build artefacts that shouldn't be here
+__pycache__/
+*.pyc
+dist/
+build/
